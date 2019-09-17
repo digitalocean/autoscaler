@@ -1,4 +1,4 @@
-// +build !gce,!aws,!azure,!kubemark,!alicloud
+// +build !gce,!aws,!azure,!kubemark,!alicloud,!digitalocean
 
 /*
 Copyright 2018 The Kubernetes Authors.
