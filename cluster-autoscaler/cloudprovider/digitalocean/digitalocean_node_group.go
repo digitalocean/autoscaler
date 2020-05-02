@@ -22,6 +22,7 @@ import (
 	"fmt"
 
 	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/digitalocean/godo"
 	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
@@ -49,6 +50,9 @@ type NodeGroup struct {
 
 	minSize int
 	maxSize int
+
+	cpus   int
+	memory int
 }
 
 // MaxSize returns maximum size of the node group.
@@ -202,7 +206,22 @@ func (n *NodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 // that are started on the node by default, using manifest (most likely only
 // kube-proxy). Implementation optional.
 func (n *NodeGroup) TemplateNodeInfo() (*schedulernodeinfo.NodeInfo, error) {
-	return nil, cloudprovider.ErrNotImplemented
+	nodeInfo := schedulernodeinfo.NewNodeInfo(cloudprovider.BuildKubeProxy(n.Id()))
+
+	cpuQuantity := resource.NewQuantity(4, resource.DecimalSI)
+	memoryQuantity := resource.NewScaledQuantity(int64(n.memory), resource.Mega)
+
+	node := &apiv1.Node{
+		Status: apiv1.NodeStatus{
+			Capacity: map[apiv1.ResourceName]resource.Quantity{
+				apiv1.ResourceCPU:    *cpuQuantity,
+				apiv1.ResourceMemory: *memoryQuantity,
+			},
+		},
+	}
+	nodeInfo.SetNode(node)
+
+	return nodeInfo, nil
 }
 
 // Exist checks if the node group really exists on the cloud provider side.

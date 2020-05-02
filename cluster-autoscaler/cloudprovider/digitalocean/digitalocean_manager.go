@@ -45,12 +45,19 @@ type nodeGroupClient interface {
 	DeleteNode(ctx context.Context, clusterID, poolID, nodeID string, req *godo.KubernetesNodeDeleteRequest) (*godo.Response, error)
 }
 
+type sizeLister interface {
+	// List lists all droplet sizes.
+	List(context.Context, *godo.ListOptions) ([]godo.Size, *godo.Response, error)
+}
+
 // Manager handles DigitalOcean communication and data caching of
 // node groups (node pools in DOKS)
 type Manager struct {
-	client     nodeGroupClient
-	clusterID  string
-	nodeGroups []*NodeGroup
+	client                nodeGroupClient
+	clusterID             string
+	nodeGroups            []*NodeGroup
+	sizeLister            sizeLister
+	capacityByDropletSlug map[string]capacity
 }
 
 // Config is the configuration of the DigitalOcean cloud provider
@@ -106,9 +113,11 @@ func newManager(configReader io.Reader) (*Manager, error) {
 	}
 
 	m := &Manager{
-		client:     doClient.Kubernetes,
-		clusterID:  cfg.ClusterID,
-		nodeGroups: make([]*NodeGroup, 0),
+		client:                doClient.Kubernetes,
+		clusterID:             cfg.ClusterID,
+		nodeGroups:            make([]*NodeGroup, 0),
+		sizeLister:            doClient.Sizes,
+		capacityByDropletSlug: map[string]capacity{},
 	}
 
 	return m, nil
@@ -118,6 +127,12 @@ func newManager(configReader io.Reader) (*Manager, error) {
 // based on the `--scan-interval`. By default it's 10 seconds.
 func (m *Manager) Refresh() error {
 	ctx := context.Background()
+
+	err := m.ensureCapacityMap(ctx)
+	if err != nil {
+		return err
+	}
+
 	nodePools, _, err := m.client.ListNodePools(ctx, m.clusterID, nil)
 	if err != nil {
 		return err
@@ -129,8 +144,13 @@ func (m *Manager) Refresh() error {
 			continue
 		}
 
-		klog.V(4).Infof("adding node pool: %q name: %s min: %d max: %d",
-			nodePool.ID, nodePool.Name, nodePool.MinNodes, nodePool.MaxNodes)
+		cap, ok := m.capacityByDropletSlug[nodePool.Size]
+		if !ok {
+			return fmt.Errorf("no capacity data found for droplet slug %q", nodePool.Size)
+		}
+
+		klog.V(4).Infof("adding node pool: %q name: %s min: %d max: %d cpus: %d memory: %d",
+			nodePool.ID, nodePool.Name, nodePool.MinNodes, nodePool.MaxNodes, cap.cpus, cap.memory)
 
 		group = append(group, &NodeGroup{
 			id:        nodePool.ID,
@@ -139,6 +159,8 @@ func (m *Manager) Refresh() error {
 			nodePool:  nodePool,
 			minSize:   nodePool.MinNodes,
 			maxSize:   nodePool.MaxNodes,
+			cpus:      cap.cpus,
+			memory:    cap.memory,
 		})
 	}
 
