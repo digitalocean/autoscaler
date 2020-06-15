@@ -19,12 +19,15 @@ package clusterapi
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
@@ -38,7 +41,13 @@ import (
 const (
 	machineProviderIDIndex = "machineProviderIDIndex"
 	nodeProviderIDIndex    = "nodeProviderIDIndex"
-	defaultMachineAPI      = "v1alpha2.cluster.x-k8s.io"
+	defaultCAPIGroup       = "cluster.x-k8s.io"
+	// CAPIGroupEnvVar contains the environment variable name which allows overriding defaultCAPIGroup.
+	CAPIGroupEnvVar               = "CAPI_GROUP"
+	resourceNameMachine           = "machines"
+	resourceNameMachineSet        = "machinesets"
+	resourceNameMachineDeployment = "machinedeployments"
+	failedMachinePrefix           = "failed-machine-"
 )
 
 // machineController watches for Nodes, Machines, MachineSets and
@@ -212,6 +221,16 @@ func (c *machineController) findMachineByProviderID(providerID normalizedProvide
 		}
 	}
 
+	if isFailedMachineProviderID(providerID) {
+		machine, err := c.findMachine(machineKeyFromFailedProviderID(providerID))
+		if err != nil {
+			return nil, err
+		}
+		if machine != nil {
+			return machine.DeepCopy(), nil
+		}
+	}
+
 	// If the machine object has no providerID--maybe actuator
 	// does not set this value (e.g., OpenStack)--then first
 	// lookup the node using ProviderID. If that is successful
@@ -225,6 +244,15 @@ func (c *machineController) findMachineByProviderID(providerID normalizedProvide
 		return nil, nil
 	}
 	return c.findMachine(node.Annotations[machineAnnotationKey])
+}
+
+func isFailedMachineProviderID(providerID normalizedProviderID) bool {
+	return strings.HasPrefix(string(providerID), failedMachinePrefix)
+}
+
+func machineKeyFromFailedProviderID(providerID normalizedProviderID) string {
+	namespaceName := strings.TrimPrefix(string(providerID), failedMachinePrefix)
+	return strings.Replace(namespaceName, "_", "/", 1)
 }
 
 // findNodeByNodeName finds the Node object keyed by name.. Returns
@@ -271,37 +299,59 @@ func (c *machineController) machinesInMachineSet(machineSet *MachineSet) ([]*Mac
 	return result, nil
 }
 
+// getCAPIGroup returns a string that specifies the group for the API.
+// It will return either the value from the
+// CAPI_GROUP environment variable, or the default value i.e cluster.x-k8s.io.
+func getCAPIGroup() string {
+	g := os.Getenv(CAPIGroupEnvVar)
+	if g == "" {
+		g = defaultCAPIGroup
+	}
+	klog.V(4).Infof("Using API Group %q", g)
+	return g
+}
+
 // newMachineController constructs a controller that watches Nodes,
 // Machines and MachineSet as they are added, updated and deleted on
 // the cluster.
 func newMachineController(
 	dynamicclient dynamic.Interface,
 	kubeclient kubeclient.Interface,
+	discoveryclient discovery.DiscoveryInterface,
 ) (*machineController, error) {
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeclient, 0)
 	informerFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicclient, 0, metav1.NamespaceAll, nil)
 
-	// TODO(alberto): let environment variable to override defaultMachineAPI
-	machineDeploymentResource, _ := schema.ParseResourceArg(fmt.Sprintf("machinedeployments.%v", defaultMachineAPI))
-
-	machineSetResource, _ := schema.ParseResourceArg(fmt.Sprintf("machinesets.%v", defaultMachineAPI))
-	if machineSetResource == nil {
-		panic("MachineSetResource")
+	CAPIGroup := getCAPIGroup()
+	CAPIVersion, err := getAPIGroupPreferredVersion(discoveryclient, CAPIGroup)
+	if err != nil {
+		return nil, fmt.Errorf("could not find preferred version for CAPI group %q: %v", CAPIGroup, err)
 	}
+	klog.Infof("Using version %q for API group %q", CAPIVersion, CAPIGroup)
 
-	machineResource, _ := schema.ParseResourceArg(fmt.Sprintf("machines.%v", defaultMachineAPI))
-	if machineResource == nil {
-		panic("machineResource")
+	gvrMachineDeployment := &schema.GroupVersionResource{
+		Group:    CAPIGroup,
+		Version:  CAPIVersion,
+		Resource: resourceNameMachineDeployment,
 	}
-	machineInformer := informerFactory.ForResource(*machineResource)
-	machineSetInformer := informerFactory.ForResource(*machineSetResource)
-	var machineDeploymentInformer informers.GenericInformer
-
-	machineDeploymentInformer = informerFactory.ForResource(*machineDeploymentResource)
+	machineDeploymentInformer := informerFactory.ForResource(*gvrMachineDeployment)
 	machineDeploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{})
 
-	machineInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{})
+	gvrMachineSet := &schema.GroupVersionResource{
+		Group:    CAPIGroup,
+		Version:  CAPIVersion,
+		Resource: resourceNameMachineSet,
+	}
+	machineSetInformer := informerFactory.ForResource(*gvrMachineSet)
 	machineSetInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{})
+
+	gvrMachine := &schema.GroupVersionResource{
+		Group:    CAPIGroup,
+		Version:  CAPIVersion,
+		Resource: resourceNameMachine,
+	}
+	machineInformer := informerFactory.ForResource(*gvrMachine)
+	machineInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{})
 
 	nodeInformer := kubeInformerFactory.Core().V1().Nodes().Informer()
 	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{})
@@ -326,10 +376,25 @@ func newMachineController(
 		machineSetInformer:        machineSetInformer,
 		nodeInformer:              nodeInformer,
 		dynamicclient:             dynamicclient,
-		machineSetResource:        machineSetResource,
-		machineResource:           machineResource,
-		machineDeploymentResource: machineDeploymentResource,
+		machineSetResource:        gvrMachineSet,
+		machineResource:           gvrMachine,
+		machineDeploymentResource: gvrMachineDeployment,
 	}, nil
+}
+
+func getAPIGroupPreferredVersion(client discovery.DiscoveryInterface, APIGroup string) (string, error) {
+	groupList, err := client.ServerGroups()
+	if err != nil {
+		return "", fmt.Errorf("failed to get ServerGroups: %v", err)
+	}
+
+	for _, group := range groupList.Groups {
+		if group.Name == APIGroup {
+			return group.PreferredVersion.Version, nil
+		}
+	}
+
+	return "", fmt.Errorf("failed to find API group %q", APIGroup)
 }
 
 func (c *machineController) machineSetProviderIDs(machineSet *MachineSet) ([]string, error) {
@@ -346,6 +411,17 @@ func (c *machineController) machineSetProviderIDs(machineSet *MachineSet) ([]str
 
 		if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
 			providerIDs = append(providerIDs, *machine.Spec.ProviderID)
+			continue
+		}
+
+		if machine.Status.FailureMessage != nil {
+			klog.V(4).Infof("Status.FailureMessage of machine %q is %q", machine.Name, *machine.Status.FailureMessage)
+			// Provide a fake ID to allow the autoscaler to track machines that will never
+			// become nodes and mark the nodegroup unhealthy after maxNodeProvisionTime.
+			// Fake ID needs to be recognised later and converted into a machine key.
+			// Use an underscore as a separator between namespace and name as it is not a
+			// valid character within a namespace name.
+			providerIDs = append(providerIDs, fmt.Sprintf("%s%s_%s", failedMachinePrefix, machine.Namespace, machine.Name))
 			continue
 		}
 
