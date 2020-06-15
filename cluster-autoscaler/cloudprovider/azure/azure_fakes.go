@@ -111,6 +111,8 @@ func (client *VirtualMachineScaleSetsClientMock) List(ctx context.Context, resou
 // VirtualMachineScaleSetVMsClientMock mocks for VirtualMachineScaleSetVMsClient.
 type VirtualMachineScaleSetVMsClientMock struct {
 	mock.Mock
+	mutex     sync.Mutex
+	FakeStore map[string]map[string]compute.VirtualMachineScaleSetVM
 }
 
 // Get gets a VirtualMachineScaleSetVM by VMScaleSetName and instanceID.
@@ -129,18 +131,14 @@ func (m *VirtualMachineScaleSetVMsClientMock) Get(ctx context.Context, resourceG
 
 // List gets a list of VirtualMachineScaleSetVMs.
 func (m *VirtualMachineScaleSetVMsClientMock) List(ctx context.Context, resourceGroupName string, virtualMachineScaleSetName string, filter string, selectParameter string, expand string) (result []compute.VirtualMachineScaleSetVM, err error) {
-	ID := fakeVirtualMachineScaleSetVMID
-	instanceID := "0"
-	vmID := "123E4567-E89B-12D3-A456-426655440000"
-	properties := compute.VirtualMachineScaleSetVMProperties{
-		VMID: &vmID,
-	}
-	result = append(result, compute.VirtualMachineScaleSetVM{
-		ID:                                 &ID,
-		InstanceID:                         &instanceID,
-		VirtualMachineScaleSetVMProperties: &properties,
-	})
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
+	if _, ok := m.FakeStore[resourceGroupName]; ok {
+		for _, v := range m.FakeStore[resourceGroupName] {
+			result = append(result, v)
+		}
+	}
 	return result, nil
 }
 
