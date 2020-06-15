@@ -23,6 +23,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-07-01/compute"
 	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
@@ -95,6 +96,40 @@ func TestIncreaseSize(t *testing.T) {
 	targetSize, err = provider.NodeGroups()[0].TargetSize()
 	assert.NoError(t, err)
 	assert.Equal(t, 5, targetSize)
+}
+
+func TestIncreaseSizeOnVMSSUpdating(t *testing.T) {
+	manager := newTestAzureManager(t)
+	vmssName := "vmss-updating"
+	var vmssCapacity int64 = 3
+	scaleSetClient := &VirtualMachineScaleSetsClientMock{
+		FakeStore: map[string]map[string]compute.VirtualMachineScaleSet{
+			"test": {
+				vmssName: {
+					Name: &vmssName,
+					Sku: &compute.Sku{
+						Capacity: &vmssCapacity,
+					},
+					VirtualMachineScaleSetProperties: &compute.VirtualMachineScaleSetProperties{
+						ProvisioningState: to.StringPtr(string(compute.ProvisioningStateUpdating)),
+					},
+				},
+			},
+		},
+	}
+	manager.azClient.virtualMachineScaleSetsClient = scaleSetClient
+	registered := manager.RegisterAsg(newTestScaleSet(manager, vmssName))
+	assert.True(t, registered)
+	manager.regenerateCache()
+
+	provider, err := BuildAzureCloudProvider(manager, nil)
+	assert.NoError(t, err)
+
+	// Scaling should continue even VMSS is under updating.
+	scaleSet, ok := provider.NodeGroups()[0].(*ScaleSet)
+	assert.True(t, ok)
+	err = scaleSet.IncreaseSize(1)
+	assert.NoError(t, err)
 }
 
 func TestBelongs(t *testing.T) {
@@ -174,9 +209,87 @@ func TestDeleteNodes(t *testing.T) {
 	}
 	scaleSet, ok := provider.NodeGroups()[0].(*ScaleSet)
 	assert.True(t, ok)
+
+	targetSize, err := scaleSet.TargetSize()
+	assert.NoError(t, err)
+	assert.Equal(t, 3, targetSize)
+
+	// Perform the delete operation
 	err = scaleSet.DeleteNodes([]*apiv1.Node{node})
 	assert.NoError(t, err)
+
+	// Ensure the the cached size has been proactively decremented
+	targetSize, err = scaleSet.TargetSize()
+	assert.NoError(t, err)
+	assert.Equal(t, 2, targetSize)
+
 	scaleSetClient.AssertNumberOfCalls(t, "DeleteInstances", 1)
+}
+
+func TestDeleteNoConflictRequest(t *testing.T) {
+	vmssName := "test-asg"
+	var vmssCapacity int64 = 3
+
+	manager := newTestAzureManager(t)
+	vmsClient := &VirtualMachineScaleSetVMsClientMock{
+		FakeStore: map[string]map[string]compute.VirtualMachineScaleSetVM{
+			"test": {
+				"0": {
+					ID:         to.StringPtr(fakeVirtualMachineScaleSetVMID),
+					InstanceID: to.StringPtr("0"),
+					VirtualMachineScaleSetVMProperties: &compute.VirtualMachineScaleSetVMProperties{
+						VMID:              to.StringPtr("123E4567-E89B-12D3-A456-426655440000"),
+						ProvisioningState: to.StringPtr("Deleting"),
+					},
+				},
+			},
+		},
+	}
+
+	scaleSetClient := &VirtualMachineScaleSetsClientMock{
+		FakeStore: map[string]map[string]compute.VirtualMachineScaleSet{
+			"test": {
+				"test-asg": {
+					Name: &vmssName,
+					Sku: &compute.Sku{
+						Capacity: &vmssCapacity,
+					},
+				},
+			},
+		},
+	}
+
+	response := autorest.Response{
+		Response: &http.Response{
+			Status: "OK",
+		},
+	}
+
+	scaleSetClient.On("DeleteInstances", mock.Anything, "test-asg", mock.Anything, mock.Anything).Return(response, nil)
+	manager.azClient.virtualMachineScaleSetsClient = scaleSetClient
+	manager.azClient.virtualMachineScaleSetVMsClient = vmsClient
+
+	resourceLimiter := cloudprovider.NewResourceLimiter(
+		map[string]int64{cloudprovider.ResourceNameCores: 1, cloudprovider.ResourceNameMemory: 10000000},
+		map[string]int64{cloudprovider.ResourceNameCores: 10, cloudprovider.ResourceNameMemory: 100000000})
+	provider, err := BuildAzureCloudProvider(manager, resourceLimiter)
+	assert.NoError(t, err)
+
+	registered := manager.RegisterAsg(newTestScaleSet(manager, "test-asg"))
+	assert.True(t, registered)
+
+	node := &apiv1.Node{
+		Spec: apiv1.NodeSpec{
+			ProviderID: "azure://" + fakeVirtualMachineScaleSetVMID,
+		},
+	}
+
+	scaleSet, ok := provider.NodeGroups()[0].(*ScaleSet)
+	assert.True(t, ok)
+
+	err = scaleSet.DeleteNodes([]*apiv1.Node{node})
+	// ensure that DeleteInstances isn't called
+	scaleSetClient.AssertNumberOfCalls(t, "DeleteInstances", 0)
 }
 
 func TestId(t *testing.T) {
